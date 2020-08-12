@@ -6,7 +6,7 @@ base_image: &base_image
   hashicorp/terraform:light
 
 working_directory: &working_directory
-  ~/project
+  ~/example
 
 default_config: &default_config
   docker:
@@ -14,7 +14,6 @@ default_config: &default_config
   working_directory: *working_directory
   environment:
     BASH_ENV: /root/.bashrc
-    TERRAFORM_ENV: ~/project/
 
 repo_cache_key: &repo_cache_key
   v1-repo-{{ .Branch }}-{{ .Revision }}
@@ -35,14 +34,18 @@ set_terraform_environment: &set_terraform_environment
     name: set terraform environment
     command: |
       cd && touch $BASH_ENV
-      cd ~/project/
+      if [ "${CIRCLE_BRANCH}" == "master" ]; then
+        echo 'export TERRAFORM_ENVIRONMENT=production' >> $BASH_ENV
+      else
+        echo 'export TERRAFORM_ENVIRONMENT=staging' >> $BASH_ENV
+      fi
 terraform_init: &terraform_init
   run:
     name: terraform init
     command: |
       source $BASH_ENV
-      cd ~/project/
-      terraform init 
+      cd environments/$TERRAFORM_ENVIRONMENT
+      terraform init
 apply_job: &apply_job
   <<: *default_config
   steps:
@@ -55,9 +58,8 @@ apply_job: &apply_job
         name: terraform apply
         command: |
           source $BASH_ENV
-          cd ~/project/
-          terraform init 
-          terraform apply --auto-approve
+          cd environments/$TERRAFORM_ENVIRONMENT
+          terraform apply --auto-approve ../../terraform.plan
 jobs:
 
   build:
@@ -69,9 +71,17 @@ jobs:
           name: terraform fmt
           command: |
             source $BASH_ENV
-            cd ~/project/
-            terraform init 
-            terraform fmt
+            cd environments/$TERRAFORM_ENVIRONMENT
+            if [ $(terraform fmt | grep -v .terraform | tee fmt_result.txt | wc -l) -gt 0 ]; then
+              echo "Format of this terraform files is not appropiate:"
+              echo
+              cat fmt_result.txt
+              rm fmt_result.txt
+              git checkout -- .
+              echo
+              echo "Please run terraform fmt"
+              exit 1
+            fi
       - *save_repo
 
   plan:
@@ -84,44 +94,17 @@ jobs:
           name: terraform plan
           command: |
             source $BASH_ENV
-            cd ~/project/
-            terraform plan
-
-
+            cd environments/$TERRAFORM_ENVIRONMENT
+            terraform plan -out=../../terraform.plan
+      - persist_to_workspace:
+          root: *working_directory
+          paths:
+            - terraform.plan
 
   apply:
     <<: *apply_job
   apply-with-approval:
     <<: *apply_job
-
-  deployment:
-    docker: [{ image: "circleci/python:latest" }]
-    working_directory: "~/project"
-
-    steps:
-      - run:
-          name: "Push to S3"
-          command: |
-            pip install --user awscli
-            export PATH="~/.local/bin:$PATH"
-            git clone https://github.com/hashicorp/learn-terraform-circleci/ .
-            pwd
-            aws s3 sync --acl public-read "/home/circleci/project/assets" s3://${APP_BUCKET}
-
-
-  destroy:
-    <<: *default_config
-    steps:
-      - *restore_repo
-      - *set_terraform_environment
-      - *terraform_init
-      - run:
-          name: "Destruction of env"
-          command: |
-            source $BASH_ENV
-            cd ~/project/
-            terraform destroy --auto-approve
-
 
 workflows:
   version: 2
@@ -131,17 +114,23 @@ workflows:
       - plan:
           requires:
             - build
+      - approve:
+          type: approval
+          requires:
+            - plan
+          filters:
+            branches:
+              only: master
+      - apply-with-approval:
+          requires:
+            - approve
+          filters:
+            branches:
+              only: master
       - apply:
           requires:
             - plan
-      - deployment:
-          requires:
-            - apply
-      - hold:
-          type: approval
-          requires:
-            - deployment
-      - destroy:
-          requires:
-            - hold
+          filters:
+            branches:
+              only: staging
 
